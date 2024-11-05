@@ -16,3 +16,7 @@ streamlit>=1.29.0
 
 # Utilitaires
 pathlib>=1.0.1
+
+# PDF Processing
+pdfplumber>=0.10.0
+PyPDF2>=3.0.0
