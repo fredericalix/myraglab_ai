@@ -11,6 +11,8 @@ from typing import List, Dict
 from sentence_transformers import SentenceTransformer
 import json
 import requests
+from PyPDF2 import PdfReader
+import pdfplumber  # Alternative plus robuste pour l'extraction de texte
 
 def verify_redis_stack():
     """Vérifie si Redis Stack est installé avec les capacités vectorielles"""
@@ -142,43 +144,81 @@ class LocalRAG:
             print(f"❌ Erreur lors de la création de l'index: {e}")
             raise
     
-    def load_documents(self, docs_path: str) -> None:
-        """Charge les documents depuis le chemin spécifié dans Redis"""
-        # D'abord, supprimer tous les documents existants
-        print("🗑️ Nettoyage de la base...")
-        for key in self.redis_client.scan_iter(f"{self.index_name}:*"):
-            self.redis_client.delete(key)
+    def load_documents(self, docs_path: str, incremental: bool = False) -> None:
+        """Charge les documents depuis le chemin spécifié dans Redis
         
-        # Ensuite, créer l'index
-        print("📑 Création de l'index vectoriel...")
-        self._create_vector_index()
-        
+        Args:
+            docs_path: Chemin vers les documents
+            incremental: Si True, ajoute les documents sans recréer l'index
+        """
         docs_path = Path(docs_path)
         if not docs_path.exists():
             raise ValueError(f"Le chemin {docs_path} n'existe pas")
         
+        # Création de l'index seulement si nécessaire
+        try:
+            self.redis_client.ft(self.index_name).info()
+            if not incremental:
+                print("🗑️ Nettoyage de la base...")
+                self.redis_client.ft(self.index_name).dropindex()
+                print("📑 Création d'un nouvel index vectoriel...")
+                self._create_vector_index()
+            else:
+                print("✅ Utilisation de l'index existant")
+        except:
+            print("📑 Création de l'index vectoriel...")
+            self._create_vector_index()
+        
         print(f"\n📂 Chargement des documents depuis {docs_path}")
         
         # Extensions supportées
-        supported_extensions = {'.md', '.txt', '.rst', '.yaml', '.yml'}
+        supported_extensions = {'.md', '.txt', '.rst', '.yaml', '.yml', '.pdf'}
         files_processed = 0
         
-        # Lister tous les fichiers avant de commencer
-        files = [f for f in docs_path.rglob('*') if f.suffix.lower() in supported_extensions]
+        # Gestion des fichiers uniques vs dossiers
+        if docs_path.is_file():
+            files = [docs_path] if docs_path.suffix.lower() in supported_extensions else []
+        else:
+            files = [f for f in docs_path.rglob('*') if f.suffix.lower() in supported_extensions]
+        
         total_files = len(files)
         print(f"📁 {total_files} fichiers trouvés à traiter")
         
+        # Vérification des documents existants
+        existing_docs = set()
+        if incremental:
+            try:
+                query = Query("*").dialect(2)
+                results = self.redis_client.ft(self.index_name).search(query)
+                existing_docs = {doc.full_path for doc in results.docs}
+            except:
+                pass
+        
         for i, file_path in enumerate(files, 1):
+            # Skip si le document existe déjà en mode incrémental
+            if incremental and str(file_path) in existing_docs:
+                print(f"\n[{i}/{total_files}] ⏭️ {file_path.name} déjà présent, ignoré")
+                continue
+                
             print(f"\n[{i}/{total_files}] Traitement de {file_path.name}...")
             try:
-                content = file_path.read_text(encoding='utf-8')
+                # Lecture différente selon le type de fichier
+                if file_path.suffix.lower() == '.pdf':
+                    print("  📄 Lecture du PDF...")
+                    content = self._extract_pdf_content(file_path)
+                else:
+                    content = file_path.read_text(encoding='utf-8')
+                
+                if not content.strip():
+                    print(f"  ⚠️ Fichier vide: {file_path.name}")
+                    continue
+                
                 embedding = self.get_embedding(content)
                 if embedding is None:
                     raise ValueError("Impossible de générer l'embedding")
                 
                 doc_id = hashlib.md5(str(file_path).encode()).hexdigest()
                 
-                # Stockage dans Redis avec le préfixe correct
                 self.redis_client.hset(
                     f"{self.index_name}:{doc_id}",
                     mapping={
@@ -187,7 +227,7 @@ class LocalRAG:
                         'source': file_path.suffix[1:],
                         'category': file_path.parent.name,
                         'full_path': str(file_path),
-                        'embedding': np.array(embedding, dtype=np.float32).tobytes()  # Stockage direct en bytes
+                        'embedding': np.array(embedding, dtype=np.float32).tobytes()
                     }
                 )
                 
@@ -199,6 +239,31 @@ class LocalRAG:
                 continue
         
         print(f"\n📊 Total: {files_processed}/{total_files} documents chargés")
+    
+    def _extract_pdf_content(self, pdf_path: Path) -> str:
+        """Extrait le texte d'un fichier PDF"""
+        try:
+            # Méthode 1: Utiliser pdfplumber (meilleure qualité)
+            with pdfplumber.open(pdf_path) as pdf:
+                text_content = []
+                for page in pdf.pages:
+                    text_content.append(page.extract_text() or '')
+                return '\n\n'.join(text_content)
+                
+        except Exception as e:
+            print(f"  ⚠️ Erreur avec pdfplumber, tentative avec PyPDF2: {e}")
+            try:
+                # Méthode 2: Utiliser PyPDF2 (fallback)
+                with open(pdf_path, 'rb') as file:
+                    reader = PdfReader(file)
+                    text_content = []
+                    for page in reader.pages:
+                        text_content.append(page.extract_text() or '')
+                    return '\n\n'.join(text_content)
+                    
+            except Exception as e:
+                print(f"  ❌ Erreur lors de l'extraction du PDF: {e}")
+                return ""
     
     def vector_search(self, query: str, top_k=3, category=None):
         """Recherche vectorielle"""
@@ -281,7 +346,9 @@ def main():
     parser.add_argument("-check", action="store_true", 
                        help="Affiche les informations de la base de données")
     parser.add_argument("--docs", type=str, 
-                       help="Chemin vers le dossier contenant les documents à charger")
+                       help="Chemin vers le dossier ou fichier à charger")
+    parser.add_argument("--incremental", action="store_true",
+                       help="Ajoute les documents sans recréer l'index")
     parser.add_argument("--chat", action="store_true",
                        help="Démarre une session de chat interactive avec le RAG")
     
@@ -290,7 +357,7 @@ def main():
     rag = LocalRAG()
     
     if args.docs:
-        rag.load_documents(args.docs)
+        rag.load_documents(args.docs, incremental=args.incremental)
     elif args.check:
         rag.check_database()
     elif args.chat:
